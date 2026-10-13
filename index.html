@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Code questions: colgrep and Pleias-RAG</title>
+  <link rel="icon" href="data:,">
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
+    form { display: flex; gap: 0.5rem; }
+    input { flex: 1; min-width: 0; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    #locations pre { white-space: pre; overflow-x: auto; }
+    details details { margin-left: 1rem; }
+    #answer-progress { width: 100%; }
+    #history { width: 100%; }
+
+    /* Syntax colors for the reference code, light and dark. */
+    :root { --code-bg: #f6f8fa; --code-border: #d0d7de; --ln: #8c959f; --kw: #cf222e; --str: #0a3069; --com: #6e7781; --num: #0550ae; --fn: #8250df; --const: #953800; }
+    @media (prefers-color-scheme: dark) {
+      :root { --code-bg: #161b22; --code-border: #30363d; --ln: #6e7681; --kw: #ff7b72; --str: #a5d6ff; --com: #8b949e; --num: #79c0ff; --fn: #d2a8ff; --const: #ffa657; }
+    }
+    #reference-text { overflow-wrap: anywhere; }
+    .code-file { overflow-wrap: anywhere; margin: 1rem 0 0.25rem; font-family: ui-monospace, monospace; font-size: 0.85rem; }
+    pre.code { background: var(--code-bg); border: 1px solid var(--code-border); border-radius: 6px; padding: 0.75rem; white-space: pre; overflow-x: auto; margin-top: 0; }
+    pre.code .ln { color: var(--ln); user-select: none; display: inline-block; text-align: right; margin-right: 1rem; }
+    .kw { color: var(--kw); } .str { color: var(--str); } .com { color: var(--com); font-style: italic; }
+    .num { color: var(--num); } .fn { color: var(--fn); } .const { color: var(--const); }
+  </style>
+</head>
+<body>
+  <p><select id="history" aria-label="Load a previous trace"><option value="">Load a previous trace…</option></select></p>
+  <form id="ask">
+    <input id="query" type="search" placeholder="Ask a question about the code" aria-label="Question about the code" required disabled>
+    <button disabled>Ask</button>
+  </form>
+  <p id="status">Loading…</p>
+  <section id="colgrep" hidden>
+    <details open>
+      <summary id="colgrep-summary"></summary>
+      <p id="colgrep-note" hidden></p>
+      <div id="locations"></div>
+      <details>
+        <summary>Agent transcript (JSON)</summary>
+        <pre id="transcript"></pre>
+      </details>
+      <details>
+        <summary>colgrep output (JSON)</summary>
+        <pre id="colgrep-json"></pre>
+      </details>
+    </details>
+  </section>
+  <section id="answer" hidden>
+    <p><small id="model"></small></p>
+    <p id="answer-status"></p>
+    <progress id="answer-progress" hidden></progress>
+    <pre id="raw"></pre>
+  </section>
+  <p id="saved"></p>
+  <section id="reference" hidden>
+    <h2>Reference answer</h2>
+    <p id="reference-text"></p>
+    <p><small id="reference-by"></small></p>
+    <div id="reference-code"></div>
+  </section>
+
+  <script type="module">
+    const form = document.querySelector("#ask");
+    const input = document.querySelector("#query");
+    const button = form.querySelector("button");
+    const status = document.querySelector("#status");
+    const colgrep = document.querySelector("#colgrep");
+    const colgrepSummary = document.querySelector("#colgrep-summary");
+    const colgrepNote = document.querySelector("#colgrep-note");
+    const locations = document.querySelector("#locations");
+    const transcript = document.querySelector("#transcript");
+    const colgrepJson = document.querySelector("#colgrep-json");
+    const answer = document.querySelector("#answer");
+    const answerStatus = document.querySelector("#answer-status");
+    const bar = document.querySelector("#answer-progress");
+    const raw = document.querySelector("#raw");
+    const saved = document.querySelector("#saved");
+    const reference = document.querySelector("#reference");
+
+    // The sections Pleias-RAG writes, in order; the bar advances as each one starts.
+    const SECTIONS = ["query_analysis", "query_report", "source_analysis", "source_report", "draft", "answer"];
+
+    const say = (text) => (status.textContent = text);
+    const json = (value) => JSON.stringify(value, null, 2);
+    const plural = (n, one, many) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+
+    // A status line with a seconds counter, for the steps that take a while.
+    let timer = null;
+    function counting(label, target = status) {
+      clearInterval(timer);
+      const start = performance.now();
+      const update = () => (target.textContent = `${label} (${Math.round((performance.now() - start) / 1000)} s)`);
+      update();
+      timer = setInterval(update, 1000);
+    }
+    const stopCounting = () => clearInterval(timer);
+
+    // Show the bar filled to value/max, or animated (no value) when progress can't be measured.
+    function progress(value, max) {
+      bar.hidden = false;
+      if (value === undefined) {
+        bar.removeAttribute("value");
+      } else {
+        bar.max = max;
+        bar.value = value;
+      }
+    }
+
+    // One collapsible block per location: numbered code, with ">" on the lines colgrep located.
+    let summaries = new Map(); // location -> its <summary>, to note later what Pleias was given
+    function renderLocations(list) {
+      summaries = new Map();
+      locations.replaceChildren(...list.map((loc) => {
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        const pre = document.createElement("pre");
+        const width = String(loc.last_line).length;
+        summary.textContent = loc.lines.length ? loc.location : `${loc.location}, could not read the file`;
+        pre.textContent = loc.lines.length
+          ? loc.lines.map((line, k) => {
+              const n = loc.first_line + k;
+              const mark = n >= loc.start_line && n <= loc.end_line ? ">" : " ";
+              return `${mark} ${String(n).padStart(width)}  ${line}`;
+            }).join("\n")
+          : "Could not read this file.";
+        details.append(summary, pre);
+        summaries.set(loc.location, summary);
+        return details;
+      }));
+    }
+
+    function showColgrep({ output, transcript: messages, locations: list, seconds }) {
+      stopCounting();
+      colgrep.hidden = false;
+      const n = list.length;
+      colgrepSummary.textContent =
+        `colgrep found ${plural(n, "location", "locations")} in ${plural(output.turns ?? 0, "turn", "turns")} ` +
+        `(${plural(output.searches ?? 0, "search", "searches")}, ${plural(output.reads ?? 0, "read", "reads")}, ${seconds.toFixed(0)} s)`;
+      colgrepNote.hidden = output.submitted !== false;
+      colgrepNote.textContent = `The agent stopped without submitting an answer (${output.end_reason}), so these are the places it read.`;
+      renderLocations(list);
+      transcript.textContent = messages ? json(messages) : "colgrep did not save a transcript.";
+      colgrepJson.textContent = json(output);
+      say(`Searched ${repo}.`);
+    }
+
+    // A GGUF weight type in words: F16 is 16-bit unquantized, Q8_0 and Q4_K_M are 8- and 4-bit quantized.
+    function describeFtype(ftype) {
+      if (!ftype) return "";
+      const float = ftype.match(/^B?F(\d+)$/);
+      if (float) return ` (${ftype}: ${float[1]}-bit, not quantized)`;
+      const quant = ftype.match(/^I?Q(\d)/);
+      return quant ? ` (${ftype}: ${quant[1]}-bit quantized)` : ` (${ftype})`;
+    }
+
+    function showPrompt({ sources, dropped, tokens, model, ftype }) {
+      document.querySelector("#model").textContent = `Model: ${model ? model.split("/").pop() : "unknown"}${describeFtype(ftype)}`;
+      sources.forEach((source) => {
+        const summary = summaries.get(source.location);
+        if (summary) summary.textContent = `${source.location}, given to Pleias as source ${source.id}`;
+      });
+      dropped.forEach((location) => {
+        const summary = summaries.get(location);
+        if (summary) summary.textContent = `${location}, not given to Pleias (no room in its 4,096-token context)`;
+      });
+      answer.hidden = false;
+      progress();
+      counting(`Pleias is reading ${plural(sources.length, "source", "sources")} (${plural(tokens, "token", "tokens")})`, answerStatus);
+    }
+
+    let pieces = 0;
+    let firstAt = 0;
+    function showText(text) {
+      if (pieces === 0) {
+        stopCounting();
+        firstAt = performance.now();
+      }
+      pieces++;
+      raw.textContent += text;
+      const step = SECTIONS.findLastIndex((s) => raw.textContent.includes(`<|${s}_start|>`)) + 1;
+      progress(step, SECTIONS.length + 1); // the answer, the longest section, isn't done when it starts
+      const where = step ? `the ${SECTIONS[step - 1].replace("_", " ")} (step ${step} of ${SECTIONS.length})` : "";
+      const seconds = (performance.now() - firstAt) / 1000;
+      const rate = pieces > 1 && seconds > 0 ? ` at ${((pieces - 1) / seconds).toFixed(1)} tokens/s` : "";
+      answerStatus.textContent = `Writing ${where}: ${plural(pieces, "token", "tokens")}${rate}`;
+    }
+
+    function finish(event) {
+      stopCounting();
+      bar.hidden = true;
+      if (event.type === "done") {
+        const rate = event.rate ? ` at ${event.rate.toFixed(1)} tokens/s` : "";
+        answerStatus.textContent = `Done: ${plural(event.tokens ?? pieces, "token", "tokens")} in ${event.seconds.toFixed(0)} s${rate}.`;
+      } else {
+        const target = answer.hidden ? status : answerStatus;
+        target.textContent = `Stopped: ${event.message}`;
+      }
+      saved.textContent = `Saved the trace to ${event.trace}.`;
+    }
+
+    // The server answers /run with one JSON event per line, as the run goes.
+    async function* events(response) {
+      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buffer = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += value;
+        let newline;
+        while ((newline = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          if (line.trim()) yield JSON.parse(line);
+        }
+      }
+    }
+
+    function reset() {
+      colgrep.hidden = answer.hidden = true;
+      locations.replaceChildren();
+      transcript.textContent = colgrepJson.textContent = raw.textContent = "";
+      answerStatus.textContent = saved.textContent = "";
+      bar.hidden = true;
+      pieces = 0;
+      reference.hidden = true;
+    }
+
+    // A small syntax highlighter for the reference code: comments, strings, numbers, keywords, calls.
+    const KEYWORDS = {
+      python: "and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield",
+      cpp: "auto break case char class const continue default delete do double else enum extern float for if inline int int64_t long namespace new return short signed sizeof static struct switch template this typedef typename unsigned using void while",
+    };
+    const CONSTANTS = /^(True|False|None|self|cls|NULL|nullptr|true|false)$/;
+    const TOKENS = {
+      python: /(#.*$)|([rbfu]*"(?:\\.|[^"\\])*"|[rbfu]*'(?:\\.|[^'\\])*')|(\b\d[\d_]*(?:\.\d+)?\b)|(\b[A-Za-z_]\w*\b)/gm,
+      cpp: /(\/\/.*$|\/\*.*?\*\/)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|(\b\d+(?:\.\d+)?f?\b)|(\b[A-Za-z_]\w*\b)/gm,
+    };
+    const escape = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+    function highlightLine(line, language) {
+      const keywords = new Set(KEYWORDS[language].split(" "));
+      let html = "", at = 0;
+      for (const m of line.matchAll(TOKENS[language])) {
+        html += escape(line.slice(at, m.index));
+        const [text, comment, string, number, word] = m;
+        let cls = comment ? "com" : string ? "str" : number ? "num" : "";
+        if (word) {
+          if (keywords.has(word)) cls = "kw";
+          else if (CONSTANTS.test(word)) cls = "const";
+          else if (/^\s*\(/.test(line.slice(m.index + word.length))) cls = "fn";
+        }
+        html += cls ? `<span class="${cls}">${escape(text)}</span>` : escape(text);
+        at = m.index + text.length;
+      }
+      return html + escape(line.slice(at));
+    }
+    function renderCode(blocks) {
+      document.querySelector("#reference-code").replaceChildren(...(blocks ?? []).flatMap((block) => {
+        const label = document.createElement("p");
+        label.className = "code-file";
+        label.textContent = `${block.path}:${block.start_line}-${block.end_line}`;
+        const pre = document.createElement("pre");
+        pre.className = "code";
+        const width = `${String(block.end_line).length}ch`;
+        pre.innerHTML = block.lines
+          .map((line, k) => `<span class="ln" style="width:${width}">${block.start_line + k}</span>${highlightLine(line, block.language)}`)
+          .join("\n");
+        return [label, pre];
+      }));
+    }
+
+    // The dropdown of saved traces, newest first.
+    const history = document.querySelector("#history");
+    async function loadHistory() {
+      try {
+        const list = await (await fetch("/traces")).json();
+        history.replaceChildren(history.options[0], ...list.map((t) => {
+          const option = document.createElement("option");
+          option.value = t.path;
+          const when = (t.started_at ?? "").slice(0, 16).replace("T", " ");
+          option.textContent = `${when}  ${t.query}${t.status === "complete" ? "" : ` (${t.status})`}`;
+          return option;
+        }));
+      } catch {
+        // The list is a convenience; asking questions still works without it.
+      }
+    }
+
+    // Show a saved trace the way the page showed the run.
+    history.addEventListener("change", async () => {
+      if (history.value) {
+        const trace = await (await fetch(`/trace?path=${encodeURIComponent(history.value)}`)).json();
+        reset();
+        input.value = trace.query;
+        const c = trace.colgrep ?? {};
+        if (c.output) showColgrep({ output: c.output, transcript: c.transcript, locations: c.snippets ?? [], seconds: c.seconds ?? 0 });
+        const p = trace.pleias;
+        if (p) {
+          showPrompt({ sources: p.sources, dropped: p.dropped, tokens: p.prompt_tokens, model: p.model_path, ftype: p.model_ftype });
+          stopCounting();
+          bar.hidden = true;
+          raw.textContent = p.completion;
+          const rate = p.timings?.predicted_per_second ? ` at ${p.timings.predicted_per_second.toFixed(1)} tokens/s` : "";
+          answerStatus.textContent = `${plural(p.tokens_predicted ?? 0, "token", "tokens")} in ${(p.seconds ?? 0).toFixed(0)} s${rate}.`;
+        }
+        say(`Loaded a saved trace from ${(trace.started_at ?? "").replace("T", " ")} (${trace.status}).` +
+          (trace.error ? ` It stopped: ${trace.error}` : ""));
+        saved.textContent = `Trace file: traces/${history.value}`;
+        const ref = trace.reference_answer;
+        reference.hidden = !ref;
+        if (ref) {
+          document.querySelector("#reference-text").textContent = ref.text;
+          document.querySelector("#reference-by").textContent = `${ref.by}, ${(ref.written_at ?? "").replace("T", " ")}` +
+            (ref.commit ? `. Code from commit ${ref.commit.slice(0, 7)}.` : "");
+          renderCode(ref.code);
+        }
+      }
+      history.value = "";
+    });
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const query = input.value.trim();
+      if (!query) return;
+      reset();
+      button.disabled = history.disabled = true; // the list stays off so a run and a trace don't mix
+      counting("Finding the code with colgrep --agent");
+      let ended = false;
+      try {
+        const response = await fetch("/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query }),
+        });
+        if (!response.ok) {
+          stopCounting();
+          say((await response.json()).error);
+          return;
+        }
+        for await (const event of events(response)) {
+          if (event.type === "colgrep") showColgrep(event);
+          else if (event.type === "prompt") showPrompt(event);
+          else if (event.type === "text") showText(event.text);
+          else if (event.type === "done" || event.type === "error") {
+            ended = true;
+            finish(event);
+          }
+        }
+        if (!ended) {
+          stopCounting();
+          say("The connection to server.py closed before the run finished. Check its Terminal window.");
+        }
+      } catch (error) {
+        stopCounting();
+        say(`Could not reach server.py: ${error.message}`);
+      } finally {
+        button.disabled = history.disabled = false;
+        loadHistory();
+      }
+    });
+
+    let repo = "";
+    try {
+      const info = await (await fetch("/info")).json();
+      repo = info.repo;
+      input.disabled = button.disabled = false;
+      input.focus();
+      say(`Ready. Questions are about ${repo}, and traces are saved in ${info.traces}.`);
+      loadHistory();
+    } catch (error) {
+      say(`Could not reach server.py: ${error.message}`);
+    }
+  </script>
+</body>
+</html>
